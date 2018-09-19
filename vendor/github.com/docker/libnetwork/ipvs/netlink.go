@@ -74,11 +74,19 @@ func setup() {
 func fillService(s *Service) nl.NetlinkRequestData {
 	cmdAttr := nl.NewRtAttr(ipvsCmdAttrService, nil)
 	nl.NewRtAttrChild(cmdAttr, ipvsSvcAttrAddressFamily, nl.Uint16Attr(s.AddressFamily))
+
 	if s.FWMark != 0 {
 		nl.NewRtAttrChild(cmdAttr, ipvsSvcAttrFWMark, nl.Uint32Attr(s.FWMark))
 	} else {
+
+		ip, err := rawIPData(s.Address,s.AddressFamily)
+
+		if err != nil {
+		    return nil
+		}
+
 		nl.NewRtAttrChild(cmdAttr, ipvsSvcAttrProtocol, nl.Uint16Attr(s.Protocol))
-		nl.NewRtAttrChild(cmdAttr, ipvsSvcAttrAddress, rawIPData(s.Address))
+		nl.NewRtAttrChild(cmdAttr, ipvsSvcAttrAddress, ip)
 
 		// Port needs to be in network byte order.
 		portBuf := new(bytes.Buffer)
@@ -102,8 +110,15 @@ func fillService(s *Service) nl.NetlinkRequestData {
 
 func fillDestinaton(d *Destination) nl.NetlinkRequestData {
 	cmdAttr := nl.NewRtAttr(ipvsCmdAttrDest, nil)
+	nl.NewRtAttrChild(cmdAttr, ipvsDestAttrAddressFamily, nl.Uint16Attr(d.AddressFamily))
 
-	nl.NewRtAttrChild(cmdAttr, ipvsDestAttrAddress, rawIPData(d.Address))
+	ip, err := rawIPData(d.Address, d.AddressFamily)
+
+	if err != nil {
+	    return nil
+	}
+
+	nl.NewRtAttrChild(cmdAttr, ipvsDestAttrAddress, ip)
 	// Port needs to be in network byte order.
 	portBuf := new(bytes.Buffer)
 	binary.Write(portBuf, binary.BigEndian, d.Port)
@@ -138,6 +153,7 @@ func (i *Handle) doCmdwithResponse(s *Service, d *Destination, cmd uint8) ([][]b
 	}
 
 	res, err := execute(i.sock, req, 0)
+
 	if err != nil {
 		return [][]byte{}, err
 	}
@@ -184,12 +200,25 @@ func getIPVSFamily() (int, error) {
 	return 0, fmt.Errorf("no family id in the netlink response")
 }
 
-func rawIPData(ip net.IP) []byte {
-	family := nl.GetIPFamily(ip)
-	if family == nl.FAMILY_V4 {
-		return ip.To4()
+func rawIPData(ip net.IP, family uint16) ([]byte, error) {
+
+	if family == 0 {
+		// unknown family - guess from address size
+		family = (uint16) (nl.GetIPFamily(ip))
 	}
-	return ip
+
+	switch family {
+ 
+	case syscall.AF_INET:
+	    return ip.To4(), nil
+
+	case syscall.AF_INET6:
+	    return ip.To16(), nil
+
+        default:
+	    return nil, fmt.Errorf("rawIPData, unknown af=%d", family)
+
+        }
 }
 
 func newIPVSRequest(cmd uint8) *nl.NetlinkRequest {
@@ -311,6 +340,7 @@ func assembleStats(msg []byte) (SvcStats, error) {
 func assembleService(attrs []syscall.NetlinkRouteAttr) (*Service, error) {
 
 	var s Service
+	var addr []byte
 
 	for _, attr := range attrs {
 
@@ -323,11 +353,7 @@ func assembleService(attrs []syscall.NetlinkRouteAttr) (*Service, error) {
 		case ipvsSvcAttrProtocol:
 			s.Protocol = native.Uint16(attr.Value)
 		case ipvsSvcAttrAddress:
-			ip, err := parseIP(attr.Value, s.AddressFamily)
-			if err != nil {
-				return nil, err
-			}
-			s.Address = ip
+			addr = ([]byte) (attr.Value)
 		case ipvsSvcAttrPort:
 			s.Port = binary.BigEndian.Uint16(attr.Value)
 		case ipvsSvcAttrFWMark:
@@ -349,6 +375,17 @@ func assembleService(attrs []syscall.NetlinkRouteAttr) (*Service, error) {
 		}
 
 	}
+
+        if ip, err := parseIP(addr, s.AddressFamily); err != nil {
+
+	    return &s, fmt.Errorf("assembleService: unable to parse addr: %s", err)
+
+	} else {
+
+	    s.Address = ip
+
+        }
+
 	return &s, nil
 }
 
@@ -413,17 +450,15 @@ func assembleDestination(attrs []syscall.NetlinkRouteAttr) (*Destination, error)
 
 	var d Destination
 
+	var addr []byte
+
 	for _, attr := range attrs {
 
 		attrType := int(attr.Attr.Type)
 
 		switch attrType {
 		case ipvsDestAttrAddress:
-			ip, err := parseIP(attr.Value, syscall.AF_INET)
-			if err != nil {
-				return nil, err
-			}
-			d.Address = ip
+			addr = ([]byte)(attr.Value)
 		case ipvsDestAttrPort:
 			d.Port = binary.BigEndian.Uint16(attr.Value)
 		case ipvsDestAttrForwardingMethod:
@@ -438,6 +473,17 @@ func assembleDestination(attrs []syscall.NetlinkRouteAttr) (*Destination, error)
 			d.AddressFamily = native.Uint16(attr.Value)
 		}
 	}
+
+	if ip, err := parseIP(addr, d.AddressFamily); err != nil {
+
+            return &d, fmt.Errorf("assembleDestination: unable to parse addr: %s", err)
+
+	} else {
+
+	    d.Address = ip
+
+	}
+
 	return &d, nil
 }
 

@@ -114,21 +114,20 @@ var iptablesChains = []struct {
 var ipsetInfo = []struct {
 	name    string
 	setType utilipset.Type
-	isIPv6  bool
 	comment string
 }{
-	{kubeLoopBackIPSet, utilipset.HashIPPortIP, true, kubeLoopBackIPSetComment},
-	{kubeClusterIPSet, utilipset.HashIPPort, true, kubeClusterIPSetComment},
-	{kubeExternalIPSet, utilipset.HashIPPort, true, kubeExternalIPSetComment},
-	{kubeLoadBalancerSet, utilipset.HashIPPort, true, kubeLoadBalancerSetComment},
-	{kubeLoadbalancerFWSet, utilipset.HashIPPort, true, kubeLoadbalancerFWSetComment},
-	{kubeLoadBalancerLocalSet, utilipset.HashIPPort, true, kubeLoadBalancerLocalSetComment},
-	{kubeLoadBalancerSourceIPSet, utilipset.HashIPPortIP, true, kubeLoadBalancerSourceIPSetComment},
-	{kubeLoadBalancerSourceCIDRSet, utilipset.HashIPPortNet, true, kubeLoadBalancerSourceCIDRSetComment},
-	{kubeNodePortSetTCP, utilipset.BitmapPort, false, kubeNodePortSetTCPComment},
-	{kubeNodePortLocalSetTCP, utilipset.BitmapPort, false, kubeNodePortLocalSetTCPComment},
-	{kubeNodePortSetUDP, utilipset.BitmapPort, false, kubeNodePortSetUDPComment},
-	{kubeNodePortLocalSetUDP, utilipset.BitmapPort, false, kubeNodePortLocalSetUDPComment},
+	{kubeLoopBackIPSet, utilipset.HashIPPortIP, kubeLoopBackIPSetComment},
+	{kubeClusterIPSet, utilipset.HashIPPort, kubeClusterIPSetComment},
+	{kubeExternalIPSet, utilipset.HashIPPort, kubeExternalIPSetComment},
+	{kubeLoadBalancerSet, utilipset.HashIPPort, kubeLoadBalancerSetComment},
+	{kubeLoadbalancerFWSet, utilipset.HashIPPort, kubeLoadbalancerFWSetComment},
+	{kubeLoadBalancerLocalSet, utilipset.HashIPPort, kubeLoadBalancerLocalSetComment},
+	{kubeLoadBalancerSourceIPSet, utilipset.HashIPPortIP, kubeLoadBalancerSourceIPSetComment},
+	{kubeLoadBalancerSourceCIDRSet, utilipset.HashIPPortNet, kubeLoadBalancerSourceCIDRSetComment},
+	{kubeNodePortSetTCP, utilipset.BitmapPort, kubeNodePortSetTCPComment},
+	{kubeNodePortLocalSetTCP, utilipset.BitmapPort, kubeNodePortLocalSetTCPComment},
+	{kubeNodePortSetUDP, utilipset.BitmapPort, kubeNodePortSetUDPComment},
+	{kubeNodePortLocalSetUDP, utilipset.BitmapPort, kubeNodePortLocalSetUDPComment},
 }
 
 // ipsetWithIptablesChain is the ipsets list with iptables source chain and the chain jump to
@@ -238,7 +237,8 @@ type realIPGetter struct {
 }
 
 // NodeIPs returns all LOCAL type IP addresses from host which are taken as the Node IPs of NodePort service.
-// Firstly, it will list source IP exists in local route table with `kernel` protocol type.  For example,
+// It will list source IP exists in local route table with `kernel` protocol type, and filter out IPVS proxier
+// created dummy device `kube-ipvs0` For example,
 // $ ip route show table local type local proto kernel
 // 10.0.0.1 dev kube-ipvs0  scope host  src 10.0.0.1
 // 10.0.0.10 dev kube-ipvs0  scope host  src 10.0.0.10
@@ -248,37 +248,22 @@ type realIPGetter struct {
 // 127.0.0.1 dev lo  scope host  src 127.0.0.1
 // 172.17.0.1 dev docker0  scope host  src 172.17.0.1
 // 192.168.122.1 dev virbr0  scope host  src 192.168.122.1
-// Then cut the unique src IP fields,
-// --> result set1: [10.0.0.1, 10.0.0.10, 10.0.0.252, 100.106.89.164, 127.0.0.1, 192.168.122.1]
-
-// NOTE: For cases where an LB acts as a VIP (e.g. Google cloud), the VIP IP is considered LOCAL, but the protocol
-// of the entry is 66, e.g. `10.128.0.6 dev ens4  proto 66  scope host`.  Therefore, the rule mentioned above will
-// filter these entries out.
-
-// Secondly, as we bind Cluster IPs to the dummy interface in IPVS proxier, we need to filter the them out so that
-// we can eventually get the Node IPs.  Fortunately, the dummy interface created by IPVS proxier is known as `kube-ipvs0`,
-// so we just need to specify the `dev kube-ipvs0` argument in ip route command, for example,
-// $ ip route show table local type local proto kernel dev kube-ipvs0
-// 10.0.0.1  scope host  src 10.0.0.1
-// 10.0.0.10  scope host  src 10.0.0.10
-// Then cut the unique src IP fields,
-// --> result set2: [10.0.0.1, 10.0.0.10]
-
-// Finally, Node IP set = set1 - set2
+// Then filter out dev==kube-ipvs0, and cut the unique src IP fields,
+// Node IP set: [100.106.89.164, 127.0.0.1, 192.168.122.1]
 func (r *realIPGetter) NodeIPs() (ips []net.IP, err error) {
 	// Pass in empty filter device name for list all LOCAL type addresses.
-	allAddress, err := r.nl.GetLocalAddresses("")
+	nodeAddress, err := r.nl.GetLocalAddresses("eth0", DefaultDummyDevice)
 	if err != nil {
 		return nil, fmt.Errorf("error listing LOCAL type addresses from host, error: %v", err)
 	}
-	dummyAddress, err := r.nl.GetLocalAddresses(DefaultDummyDevice)
-	if err != nil {
-		return nil, fmt.Errorf("error listing LOCAL type addresses from device: %s, error: %v", DefaultDummyDevice, err)
-	}
-	// exclude ip address from dummy interface created by IPVS proxier - they are all Cluster IPs.
-	nodeAddress := allAddress.Difference(dummyAddress)
+
 	// translate ip string to IP
 	for _, ipStr := range nodeAddress.UnsortedList() {
+
+		if strings.Contains(ipStr,"/") {
+			parts := strings.SplitN(ipStr,"/",2)
+			ipStr = parts[0]
+		}
 		ips = append(ips, net.ParseIP(ipStr))
 	}
 	return ips, nil
@@ -394,10 +379,7 @@ func NewProxier(ipt utiliptables.Interface,
 	// initialize ipsetList with all sets we needed
 	proxier.ipsetList = make(map[string]*IPSet)
 	for _, is := range ipsetInfo {
-		if is.isIPv6 {
-			proxier.ipsetList[is.name] = NewIPSet(ipset, is.name, is.setType, isIPv6, is.comment)
-		}
-		proxier.ipsetList[is.name] = NewIPSet(ipset, is.name, is.setType, false, is.comment)
+	    proxier.ipsetList[is.name] = NewIPSet(ipset, is.name, is.setType, isIPv6, is.comment)
 	}
 	burstSyncs := 2
 	glog.V(3).Infof("minSyncPeriod: %v, syncPeriod: %v, burstSyncs: %d", minSyncPeriod, syncPeriod, burstSyncs)
@@ -739,6 +721,8 @@ func (proxier *Proxier) syncProxyRules() {
 	activeIPVSServices := map[string]bool{}
 	// currentIPVSServices represent IPVS services listed from the system
 	currentIPVSServices := make(map[string]*utilipvs.VirtualServer)
+	// activeBindAddrs represents ip address successfully bind to DefaultDummyDevice in this round of sync
+	activeBindAddrs := map[string]bool{}
 
 	// Build IPVS rules for each service.
 	for svcName, svc := range proxier.serviceMap {
@@ -809,6 +793,7 @@ func (proxier *Proxier) syncProxyRules() {
 		// We need to bind ClusterIP to dummy interface, so set `bindAddr` parameter to `true` in syncService()
 		if err := proxier.syncService(svcNameString, serv, true); err == nil {
 			activeIPVSServices[serv.String()] = true
+			activeBindAddrs[serv.Address.String()] = true
 			// ExternalTrafficPolicy only works for NodePort and external LB traffic, does not affect ClusterIP
 			// So we still need clusterIP rules in onlyNodeLocalEndpoints mode.
 			if err := proxier.syncEndpoint(svcName, false, serv); err != nil {
@@ -878,6 +863,7 @@ func (proxier *Proxier) syncProxyRules() {
 			}
 			if err := proxier.syncService(svcNameString, serv, true); err == nil {
 				activeIPVSServices[serv.String()] = true
+				activeBindAddrs[serv.Address.String()] = true
 				if err := proxier.syncEndpoint(svcName, false, serv); err != nil {
 					glog.Errorf("Failed to sync endpoint for service: %v, err: %v", serv, err)
 				}
@@ -980,6 +966,7 @@ func (proxier *Proxier) syncProxyRules() {
 					// check if service need skip endpoints that not in same host as kube-proxy
 					onlyLocal := svcInfo.SessionAffinityType == api.ServiceAffinityClientIP && svcInfo.OnlyNodeLocalEndpoints
 					activeIPVSServices[serv.String()] = true
+					activeBindAddrs[serv.Address.String()] = true
 					if err := proxier.syncEndpoint(svcName, onlyLocal, serv); err != nil {
 						glog.Errorf("Failed to sync endpoint for service: %v, err: %v", serv, err)
 					}
@@ -1083,16 +1070,20 @@ func (proxier *Proxier) syncProxyRules() {
 			// Build ipvs kernel routes for each node ip address
 			nodeIPs := make([]net.IP, 0)
 			for address := range addresses {
+
 				if !utilproxy.IsZeroCIDR(address) {
 					nodeIPs = append(nodeIPs, net.ParseIP(address))
 					continue
 				}
+
 				// zero cidr
 				nodeIPs, err = proxier.ipGetter.NodeIPs()
+
 				if err != nil {
 					glog.Errorf("Failed to list all node IPs from host, err: %v", err)
 				}
 			}
+
 			for _, nodeIP := range nodeIPs {
 				// ipvs call
 				serv := &utilipvs.VirtualServer{
@@ -1160,6 +1151,14 @@ func (proxier *Proxier) syncProxyRules() {
 		glog.Errorf("Failed to get ipvs service, err: %v", err)
 	}
 	proxier.cleanLegacyService(activeIPVSServices, currentIPVSServices)
+
+	// Clean up legacy bind address
+	// currentBindAddrs represents ip addresses bind to DefaultDummyDevice from the system
+	currentBindAddrs, err := proxier.netlinkHandle.ListBindAddress(DefaultDummyDevice)
+	if err != nil {
+		glog.Errorf("Failed to get bind address, err: %v", err)
+	}
+	proxier.cleanLegacyBindAddr(activeBindAddrs, currentBindAddrs)
 
 	// Update healthz timestamp
 	if proxier.healthzServer != nil {
@@ -1478,6 +1477,7 @@ func (proxier *Proxier) syncService(svcName string, vs *utilipvs.VirtualServer, 
 	// bind service address to dummy interface even if service not changed,
 	// in case that service IP was removed by other processes
 	if bindAddr {
+		glog.V(4).Infof("Bind addr %s", vs.Address.String())
 		_, err := proxier.netlinkHandle.EnsureAddressBind(vs.Address.String(), DefaultDummyDevice)
 		if err != nil {
 			glog.Errorf("Failed to bind service address to dummy device %q: %v", svcName, err)
@@ -1516,6 +1516,9 @@ func (proxier *Proxier) syncEndpoint(svcPortName proxy.ServicePortName, onlyNode
 	}
 
 	if !curEndpoints.Equal(newEndpoints) {
+
+		glog.Errorf("cur: %v new:%v",curEndpoints,newEndpoints)
+
 		// Create new endpoints
 		for _, ep := range newEndpoints.Difference(curEndpoints).UnsortedList() {
 			ip, port, err := net.SplitHostPort(ep)
@@ -1568,7 +1571,6 @@ func (proxier *Proxier) syncEndpoint(svcPortName proxy.ServicePortName, onlyNode
 }
 
 func (proxier *Proxier) cleanLegacyService(activeServices map[string]bool, currentServices map[string]*utilipvs.VirtualServer) {
-	unbindIPAddr := sets.NewString()
 	for cs := range currentServices {
 		svc := currentServices[cs]
 		if _, ok := activeServices[cs]; !ok {
@@ -1587,16 +1589,21 @@ func (proxier *Proxier) cleanLegacyService(activeServices map[string]bool, curre
 				if err := proxier.ipvs.DeleteVirtualServer(svc); err != nil {
 					glog.Errorf("Failed to delete service, error: %v", err)
 				}
-				unbindIPAddr.Insert(svc.Address.String())
 			}
 		}
 	}
+}
 
-	for _, addr := range unbindIPAddr.UnsortedList() {
-		err := proxier.netlinkHandle.UnbindAddress(addr, DefaultDummyDevice)
-		// Ignore no such address error when try to unbind address
-		if err != nil {
-			glog.Errorf("Failed to unbind service addr %s from dummy interface %s: %v", addr, DefaultDummyDevice, err)
+func (proxier *Proxier) cleanLegacyBindAddr(activeBindAddrs map[string]bool, currentBindAddrs []string) {
+	for _, addr := range currentBindAddrs {
+		if _, ok := activeBindAddrs[addr]; !ok {
+			// This address was not processed in the latest sync loop
+			glog.V(4).Infof("Unbind addr %s", addr)
+			err := proxier.netlinkHandle.UnbindAddress(addr, DefaultDummyDevice)
+			// Ignore no such address error when try to unbind address
+			if err != nil {
+				glog.Errorf("Failed to unbind service addr %s from dummy interface %s: %v", addr, DefaultDummyDevice, err)
+			}
 		}
 	}
 }
